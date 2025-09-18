@@ -163,7 +163,7 @@ def analyze_play(guesses: List[str], target: str):
         received_info_percentile = percentile_rank(info_distribution, received_info_bits) if info_distribution else 0.0
         if guess_entropy_bits == 0:
             received_info_percentile = 0.0
-        if len(new_remaining) == 1:
+        if len(remaining) == 1:
             best_guess = target
 
         results.append({
