@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from scipy.stats import entropy
 from tqdm import tqdm
 
-# ---------- Config ----------
+# CONFIG
 DICT_FILE_ALL = "all_words.txt"
 DICT_FILE_SOL = "words.txt"
 CACHE_FILE = "pattern_dict.p"
@@ -204,8 +204,6 @@ Rules:
 """
 
 async def extract_words_with_gemini(image_bytes: bytes, mime_type: str) -> Dict:
-    # Prefer structured JSON output; see google-genai "structured output" docs.
-    # https://ai.google.dev/gemini-api/docs/structured-output
     try:
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
@@ -235,7 +233,6 @@ async def extract_words_with_gemini(image_bytes: bytes, mime_type: str) -> Dict:
                 pass
         return {"guesses": [], "target": None, "notes": "parse_failed"}
 
-# ---------- Helpers ----------
 def format_bits(x: float) -> str:
     if x == float("inf"):
         return "∞"
@@ -264,7 +261,7 @@ def detect_mime(attachment: discord.Attachment) -> str:
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     """
-    Usage: !wordleanalysis [optional_target]
+    Usage: !wanal [optional_target]
     - attach a Wordle screenshot to your message
     - optionally pass the target word if you already know it
     """
@@ -348,7 +345,6 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
         await ctx.channel.send("I can't DM you (privacy settings). Please DM me first, then re-run the command.")
 
 
-# ---------- Run ----------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN not set")
