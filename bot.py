@@ -121,7 +121,8 @@ def convert_pattern_to_emoji_string(pattern: Tuple[int, ...]) -> str:
 
 def analyze_play(guesses: List[str], target: str):
     all_dictionary, solution_set, WORD_LEN = load_wordlists()
-    target = target.strip().lower()
+    if target is None or target.strip().lower() == "None":
+        target = guesses[-1]
     assert len(target) == WORD_LEN, f"Target must be {WORD_LEN} letters."
 
     pattern_dict = load_or_build_pattern_cache(all_dictionary)
