@@ -130,6 +130,7 @@ def analyze_play(guesses: List[str], target: str):
     results = []
 
     for round_idx, guess in enumerate(guesses, start=1):
+        print(f"Round {round_idx}: Guessing '{guess}'")
         guess = guess.strip().lower()
         if guess not in pattern_dict:
             raise ValueError(f"Guess '{guess}' not in allowed list.")
@@ -299,8 +300,11 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
         return
 
     # Delete the initial message and response
-    await ctx.message.delete()
-    await response.delete()
+    try:
+        await ctx.message.delete()
+        await response.delete()
+    except Exception:
+        print("Failed to delete messages.")
 
     # Run analysis
     try:
