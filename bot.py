@@ -343,7 +343,9 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     try:
         await ctx.author.send(embed=emb)
     except discord.Forbidden:
-        await ctx.reply("I can't DM you (privacy settings). Please DM me first, then re-run the command.", mention_author=False)
+        # send the message into the channel
+        await ctx.channel.send(embed=emb)
+        await ctx.channel.send("I can't DM you (privacy settings). Please DM me first, then re-run the command.")
 
 
 # ---------- Run ----------
