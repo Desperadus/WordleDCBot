@@ -20,9 +20,8 @@ from tqdm import tqdm
 DICT_FILE_ALL = "all_words.txt"
 DICT_FILE_SOL = "words.txt"
 CACHE_FILE = "pattern_dict.p"
-GEMINI_MODEL = "gemini-2.5-flash"  # fall back to "gemini-2.0-flash" if needed
+GEMINI_MODEL = "gemini-2.5-flash"
 
-# ---------- Discord setup ----------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
@@ -34,16 +33,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY not set")
 
-# ---------- Gemini (google-genai) ----------
-# Docs & examples: ai.google.dev (image understanding + JSON output)
-# https://ai.google.dev/gemini-api/docs/image-understanding
-# https://ai.google.dev/gemini-api/docs/structured-output
+
 from google import genai
 from google.genai import types as genai_types
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# ---------- Wordle analysis core (your earlier logic, compact & non-verbose) ----------
 def calculate_pattern(guess: str, true: str) -> Tuple[int, int, int, int, int]:
     wrong = [i for i, v in enumerate(guess) if v != true[i]]
     counts = Counter(true[i] for i in wrong)
@@ -132,6 +127,22 @@ def analyze_play(guesses: List[str], target: str):
         if guess not in pattern_dict:
             raise ValueError(f"Guess '{guess}' not in allowed list.")
 
+        if guess == target:
+            results.append({
+                "round": round_idx,
+                "guess": guess,
+                "pattern": "".join(map(str, pattern)),
+                "percentile_expected": pct_expected,
+                "guess_entropy_bits": guess_entropy_bits,
+                "received_info_bits": received_info_bits,
+                "luck_bits": luck_bits,
+                "received_info_percentile": received_info_percentile,
+                "best_guess": best_guess,
+                "best_entropy_bits": best_entropy_bits,
+                "remaining_after": len(new_remaining),
+                "win": guess == target
+            })
+
         ent_bits, pattern_counts = calculate_entropies_bits(
             all_dictionary, remaining, pattern_dict, all_patterns
         )
@@ -160,8 +171,8 @@ def analyze_play(guesses: List[str], target: str):
         received_info_percentile = percentile_rank(info_distribution, received_info_bits) if info_distribution else 0.0
         if guess_entropy_bits == 0:
             received_info_percentile = 0.0
+        if len(new_remaining) == 1:
             best_guess = target
-
 
         results.append({
             "round": round_idx,
@@ -175,12 +186,12 @@ def analyze_play(guesses: List[str], target: str):
             "best_guess": best_guess,
             "best_entropy_bits": best_entropy_bits,
             "remaining_after": len(new_remaining),
+            "win": guess == target
         })
         remaining = new_remaining
 
     return results
 
-# ---------- Gemini OCR/parsing for Wordle screenshot ----------
 WORDLE_JSON_PROMPT = """
 You are an OCR + parser for Wordle screenshots.
 
@@ -254,8 +265,7 @@ def detect_mime(attachment: discord.Attachment) -> str:
     if name.endswith(".webp"): return "image/webp"
     return "image/png"
 
-# ---------- Command ----------
-@bot.command(name="wordleanalysis")
+@bot.command(name="wanal")
 @commands.cooldown(1, 8, commands.BucketType.user)
 async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     """
@@ -316,14 +326,17 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     # Per-round fields
     for r in results:
         name = f"Round {r['round']}: `{r['guess']}` → pattern `{r['pattern']}`"
-        val = (
-            f"• **Expected entropy:** {format_bits(r['guess_entropy_bits'])} bits "
-            f"(pct {r['percentile_expected']:.1f}%)\n"
-            f"• **Received entropy:** {format_bits(r['received_info_bits'])} bits "
-            f"(luck Δ {format_bits(r['luck_bits'])}, pct {r['received_info_percentile']:.1f}%)\n"
-            f"• **Best available guess:** `{r['best_guess']}` ({format_bits(r['best_entropy_bits'])} bits)\n"
-            f"• **Remaining solutions:** {r['remaining_after']}"
-        )
+        if r.get("win"):
+            val = "• **Result:** ✅ Correct my nigga!"
+        else:
+            val = (
+                f"• **Expected entropy:** {format_bits(r['guess_entropy_bits'])} bits "
+                f"(pct {r['percentile_expected']:.1f}%)\n"
+                f"• **Received entropy:** {format_bits(r['received_info_bits'])} bits "
+                f"(luck Δ {format_bits(r['luck_bits'])}, pct {r['received_info_percentile']:.1f}%)\n"
+                f"• **Best available guess:** `{r['best_guess']}` ({format_bits(r['best_entropy_bits'])} bits)\n"
+                f"• **Remaining solutions:** {r['remaining_after']}"
+            )
         emb.add_field(name=name, value=val, inline=False)
 
     emb.set_footer(text="Powered by Pikachuj")
