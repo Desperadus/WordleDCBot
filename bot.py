@@ -81,12 +81,14 @@ def calculate_entropies_bits(
         pattern_counts[w] = counts_map
     return ent_bits, pattern_counts
 
-def percentile_rank(values: List[float], x: float) -> float:
+def percentile_rank(values, x, eps=1e-9):
+    # 100% if you tie the maximum (within tolerance)
+    mx = max(values)
+    if abs(x - mx) <= eps:
+        return 100.0
     n = len(values)
-    if n == 0:
-        return 0.0
-    less = sum(v < x for v in values)
-    equal = sum(v == x for v in values)
+    less = sum(v < x - eps for v in values)
+    equal = sum(abs(v - x) <= eps for v in values)
     return 100.0 * (less + 0.5 * equal) / n
 
 def load_wordlists():
