@@ -112,6 +112,13 @@ def load_or_build_pattern_cache(all_dictionary: List[str]):
     pickle.dump(pattern_dict, open(CACHE_FILE, "wb+"))
     return pattern_dict
 
+def convert_pattern_to_emoji_string(pattern: Tuple[int, ...]) -> str:
+    return "".join({
+        0: "⬜",
+        1: "🟨",
+        2: "🟩"
+    }[i] for i in pattern)
+
 def analyze_play(guesses: List[str], target: str):
     all_dictionary, solution_set, WORD_LEN = load_wordlists()
     target = target.strip().lower()
@@ -126,22 +133,6 @@ def analyze_play(guesses: List[str], target: str):
         guess = guess.strip().lower()
         if guess not in pattern_dict:
             raise ValueError(f"Guess '{guess}' not in allowed list.")
-
-        if guess == target:
-            results.append({
-                "round": round_idx,
-                "guess": guess,
-                "pattern": "".join(map(str, pattern)),
-                "percentile_expected": pct_expected,
-                "guess_entropy_bits": guess_entropy_bits,
-                "received_info_bits": received_info_bits,
-                "luck_bits": luck_bits,
-                "received_info_percentile": received_info_percentile,
-                "best_guess": best_guess,
-                "best_entropy_bits": best_entropy_bits,
-                "remaining_after": len(new_remaining),
-                "win": guess == target
-            })
 
         ent_bits, pattern_counts = calculate_entropies_bits(
             all_dictionary, remaining, pattern_dict, all_patterns
@@ -177,7 +168,7 @@ def analyze_play(guesses: List[str], target: str):
         results.append({
             "round": round_idx,
             "guess": guess,
-            "pattern": "".join(map(str, pattern)),
+            "pattern": convert_pattern_to_emoji_string(pattern),
             "percentile_expected": pct_expected,
             "guess_entropy_bits": guess_entropy_bits,
             "received_info_bits": received_info_bits,
