@@ -6,6 +6,9 @@ import math
 import pickle
 import asyncio
 import itertools
+import logging
+import uuid
+from logging.handlers import RotatingFileHandler
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Optional
 
@@ -21,6 +24,37 @@ DICT_FILE_ALL = "all_words.txt"
 DICT_FILE_SOL = "words.txt"
 CACHE_FILE = "pattern_dict.p"
 GEMINI_MODEL = "gemini-2.5-flash"
+
+def setup_logging():
+    os.makedirs("logs", exist_ok=True)
+    logger = logging.getLogger("wordlebot")
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    # File (rotating) handler
+    fh = RotatingFileHandler(
+        "logs/bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    fh.setFormatter(fmt)
+    # Console handler (useful for local/dev)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    # Avoid duplicate handlers if reloaded
+    if not logger.handlers:
+        logger.addHandler(fh)
+        logger.addHandler(ch)
+    return logger
+
+LOGGER = setup_logging()
+
+def log_event(event: str, **payload):
+    """Log a JSON line for easier analysis later."""
+    try:
+        LOGGER.info(json.dumps({"event": event, **payload}, ensure_ascii=False, default=str))
+    except Exception:
+        # Fallback if something isn't JSON-serializable
+        LOGGER.info(f"{event} {payload}")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -38,6 +72,47 @@ from google import genai
 from google.genai import types as genai_types
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+@bot.event
+async def on_ready():
+    try:
+        user = str(bot.user) if bot.user else None
+        guilds = [g.id for g in bot.guilds]
+        log_event("bot_ready", bot_user=user, guild_count=len(guilds), guild_ids=guilds)
+    except Exception:
+        LOGGER.exception("Failed to log bot_ready")
+
+@bot.event
+async def on_command_error(ctx, error):
+    user_name = str(ctx.author) if ctx and getattr(ctx, "author", None) else None
+    user_id = getattr(ctx.author, "id", None) if ctx and getattr(ctx, "author", None) else None
+    guild_id = getattr(ctx.guild, "id", None) if ctx and getattr(ctx, "guild", None) else None
+    channel_id = getattr(ctx.channel, "id", None) if ctx and getattr(ctx, "channel", None) else None
+    if isinstance(error, commands.CommandOnCooldown):
+        log_event(
+            "command_cooldown",
+            command=getattr(ctx.command, "name", None),
+            user_name=user_name,
+            user_id=user_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            retry_after=getattr(error, "retry_after", None),
+        )
+        try:
+            await ctx.reply(f"You're on cooldown. Try again in {error.retry_after:.1f}s.", mention_author=False)
+        except Exception:
+            pass
+    else:
+        log_event(
+            "command_error",
+            command=getattr(ctx.command, "name", None),
+            user_name=user_name,
+            user_id=user_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            error=str(error),
+        )
+        raise error
 
 def calculate_pattern(guess: str, true: str) -> Tuple[int, int, int, int, int]:
     wrong = [i for i, v in enumerate(guess) if v != true[i]]
@@ -129,17 +204,18 @@ def analyze_play(guesses: List[str], target: str):
 
     pattern_dict = load_or_build_pattern_cache(all_dictionary)
     all_patterns = list(itertools.product([0, 1, 2], repeat=WORD_LEN))
-    remaining = set(solution_set)
+    remaining_solutions = set(solution_set)
+    remaining_allowed = set(all_dictionary)
     results = []
 
     for round_idx, guess in enumerate(guesses, start=1):
-        print(f"Round {round_idx}: Guessing '{guess}'")
+        LOGGER.debug(f"Round {round_idx}: Guessing '{guess}'")
         guess = guess.strip().lower()
         if guess not in pattern_dict:
             raise ValueError(f"Guess '{guess}' not in allowed list.")
 
         ent_bits, pattern_counts = calculate_entropies_bits(
-            all_dictionary, remaining, pattern_dict, all_patterns
+            all_dictionary, remaining_solutions, pattern_dict, all_patterns
         )
         best_guess, best_entropy_bits = max(ent_bits.items(), key=lambda kv: kv[1])
         guess_entropy_bits = ent_bits[guess]
@@ -147,7 +223,7 @@ def analyze_play(guesses: List[str], target: str):
 
         pattern = calculate_pattern(guess, target)
         observed_bucket_size = pattern_counts[guess][pattern]
-        total_before = len(remaining)
+        total_before = len(remaining_solutions)
         received_info_bits = (
             float("inf") if observed_bucket_size < 1
             else math.log2(total_before / observed_bucket_size)
@@ -156,8 +232,10 @@ def analyze_play(guesses: List[str], target: str):
 
         # shrink remaining to solutions in the observed bucket
         bucket_all = pattern_dict[guess].get(pattern, set())
-        new_remaining = remaining & (bucket_all & solution_set)
+        bucket_solutions = bucket_all & solution_set
 
+        remaining_solutions &= bucket_solutions
+        remaining_allowed &= bucket_all
         # How "lucky" among all patterns for this guess?
         info_distribution = []
         for _, size in pattern_counts[guess].items():
@@ -166,7 +244,7 @@ def analyze_play(guesses: List[str], target: str):
         received_info_percentile = percentile_rank(info_distribution, received_info_bits) if info_distribution else 0.0
         if guess_entropy_bits == 0:
             received_info_percentile = 0.0
-        if len(remaining) == 1:
+        if len(remaining_allowed) == 1:
             best_guess = target
 
         results.append({
@@ -180,10 +258,11 @@ def analyze_play(guesses: List[str], target: str):
             "received_info_percentile": received_info_percentile,
             "best_guess": best_guess,
             "best_entropy_bits": best_entropy_bits,
-            "remaining_after": len(new_remaining),
+            "remaining_solutions": len(remaining_solutions),
+            "remaining_allowed": len(remaining_allowed),
             "win": guess == target
         })
-        remaining = new_remaining
+        
 
     return results
 
@@ -265,11 +344,25 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     - attach a Wordle screenshot to your message
     - optionally pass the target word if you already know it
     """
-    print("Wordle analysis initiated.")
+    user_name = str(ctx.author)
+    user_id = getattr(ctx.author, "id", None)
+    guild_id = getattr(ctx.guild, "id", None) if ctx.guild else None
+    channel_id = getattr(ctx.channel, "id", None)
+    request_id = str(uuid.uuid4())
+    log_event(
+        "command_invoked",
+        command="!wanal",
+        user_name=user_name,
+        user_id=user_id,
+        guild_id=guild_id,
+        channel_id=channel_id,
+        request_id=request_id,
+        attachments=[a.filename for a in ctx.message.attachments],
+    )
     if not ctx.message.attachments:
         return await ctx.reply("Please attach a Wordle screenshot to your command.", mention_author=False)
 
-    #Reply to user that the analysis is underway
+    # Reply to user that the analysis is underway
     response = await ctx.reply("Analyzing your Wordle screenshot...", mention_author=False)
 
     # Take the first image attachment
@@ -282,19 +375,32 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     guesses = ensure_list_of_words(parsed.get("guesses", []))
     target = parsed.get("target")
     notes = parsed.get("notes", "")
-    print(f"Parsed guesses: {guesses}, target: {target}, notes: {notes}")
+    log_event(
+        "parsed_input",
+        user_name=user_name,
+        user_id=user_id,
+    request_id=request_id,
+        guesses=guesses,
+        target=target,
+        notes=notes,
+        mime=mime,
+        attachment_name=att.filename,
+    )
 
     # Allow explicit override via command arg
     if target_arg and isinstance(target_arg, str) and len(target_arg) == 5 and target_arg.isalpha():
         target = target_arg.lower()
+        log_event("target_overridden", user_name=user_name, user_id=user_id, request_id=request_id, target=target)
 
     if not guesses:
+        log_event("no_guesses_detected", user_name=user_name, user_id=user_id, request_id=request_id, target_arg=target_arg)
         return await ctx.reply("I couldn't detect any guesses in the screenshot. Please try a clearer image.", mention_author=False)
 
     if not target:
-        await ctx.reply("I couldn't see the solution in the screenshot. DM me again with `!wordleanalysis TARGETWORD` (attach the same image or skip the image).", mention_author=False)
+        log_event("no_target_detected", user_name=user_name, user_id=user_id, request_id=request_id, guesses=guesses)
+        await ctx.reply("I couldn't see the solution in the screenshot. DM me again with `!wanal TARGETWORD` (attach the same image or skip the image).", mention_author=False)
         try:
-            await ctx.author.send("Heads up: I couldn't detect the target word. If you know it, DM me:\n`!wordleanalysis TARGETWORD`.")
+            await ctx.author.send("Heads up: I couldn't detect the target word. If you know it, DM me:\n`!wanal TARGETWORD`.")
         except discord.Forbidden:
             pass
         return
@@ -304,13 +410,39 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
         await ctx.message.delete()
         await response.delete()
     except Exception:
-        print("Failed to delete messages.")
+        LOGGER.warning("Failed to delete messages.")
 
     # Run analysis
     try:
         results = analyze_play(guesses, target)
     except Exception as e:
+        log_event("analysis_error", user_name=user_name, user_id=user_id, request_id=request_id, error=str(e))
         return await ctx.reply(f"Analysis error: {e}", mention_author=False)
+
+    # Log per-round entropy and progress stats
+    for r in results:
+        log_event(
+            "analysis_round",
+            user_name=user_name,
+            user_id=user_id,
+            request_id=request_id,
+            target=target,
+            **r,
+        )
+
+    # Summary log
+    total_rounds = len(results)
+    won = any(r.get("win") for r in results)
+    log_event(
+        "analysis_completed",
+        user_name=user_name,
+        user_id=user_id,
+        request_id=request_id,
+        target=target,
+        total_rounds=total_rounds,
+        won=won,
+        guesses=guesses,
+    )
 
     # Build a pretty embed for DM
     emb = discord.Embed(
@@ -322,7 +454,7 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     for r in results:
         name = f"Round {r['round']}: `{r['guess']}` → pattern `{r['pattern']}`"
         if r.get("win"):
-            val = "• **Result:** ✅ Correct my nigga!"
+            val = "• **Result:** ✅ Correct my dude!"
         else:
             val = (
                 f"• **Expected entropy:** {format_bits(r['guess_entropy_bits'])} bits "
@@ -330,7 +462,8 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
                 f"• **Received entropy:** {format_bits(r['received_info_bits'])} bits "
                 f"(luck Δ {format_bits(r['luck_bits'])}, pct {r['received_info_percentile']:.1f}%)\n"
                 f"• **Best available guess:** `{r['best_guess']}` ({format_bits(r['best_entropy_bits'])} bits)\n"
-                f"• **Remaining solutions:** {r['remaining_after']}"
+                f"• **Remaining solutions:** {r['remaining_solutions']}"
+                f"• **Remaining allowed:** {r['remaining_allowed']}"
             )
         emb.add_field(name=name, value=val, inline=False)
 
@@ -339,10 +472,12 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
     # DM the user
     try:
         await ctx.author.send(embed=emb)
+        log_event("dm_sent", user_name=user_name, user_id=user_id, request_id=request_id, destination="dm", rounds=len(results))
     except discord.Forbidden:
         # send the message into the channel
         await ctx.channel.send(embed=emb)
         await ctx.channel.send("I can't DM you (privacy settings). Please DM me first, then re-run the command.")
+        log_event("dm_failed_privacy", user_name=user_name, user_id=user_id, request_id=request_id, destination="channel", rounds=len(results))
 
 
 if __name__ == "__main__":
