@@ -568,7 +568,7 @@ async def wordleanalysis(ctx, target_arg: Optional[str] = None):
                 f"• **Expected entropy:** {format_bits(r['guess_entropy_bits'])} bits "
                 f"(pct {r['percentile_expected']:.1f}%)\n"
                 f"• **Received entropy:** {format_bits(r['received_info_bits'])} bits "
-                f"(luck Δ {format_bits(r['luck_bits'])}, pct {r['received_info_percentile']:.1f}%)\n"
+                f"(luck Δ {format_bits(r['luck_bits'])})\n"
                 f"• **Best available guess:** `{r['best_guess']}` ({format_bits(r['best_entropy_bits'])} bits)\n"
                 f"• **Remaining solutions:** {r['remaining_solutions']}"
                 f"• **Remaining allowed:** {r['remaining_allowed']}"
