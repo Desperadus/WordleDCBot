@@ -12,6 +12,8 @@ from logging.handlers import RotatingFileHandler
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Optional
 
+from multiprocessing import Pool, cpu_count
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -114,6 +116,87 @@ async def on_command_error(ctx, error):
         )
         raise error
 
+POW3 = (1, 3, 9, 27, 81)  # for base-3 encoding of 5-trit patterns
+
+def _encode_trits(trits):
+    return trits[0]*POW3[0] + trits[1]*POW3[1] + trits[2]*POW3[2] + trits[3]*POW3[3] + trits[4]*POW3[4]
+
+def calculate_pattern_id(guess: str, true: str) -> int:
+    """
+    Return Wordle feedback as a compact int (0..242).
+    Two-pass algorithm with 26-letter counts; much faster than Counter.
+    """
+    pattern = [0]*5
+    rem = [0]*26
+
+    # Greens first
+    for i, (g, t) in enumerate(zip(guess, true)):
+        if g == t:
+            pattern[i] = 2
+        else:
+            rem[ord(t) - 97] += 1
+
+    # Then yellows / greys
+    for i, g in enumerate(guess):
+        if pattern[i] == 0:
+            idx = ord(g) - 97
+            if rem[idx] > 0:
+                pattern[i] = 1
+                rem[idx] -= 1
+            else:
+                pattern[i] = 0
+
+    return _encode_trits(pattern)
+
+def _entropy_bits_from_counts(counts):
+    total = sum(counts)
+    if total == 0:
+        return 0.0
+    H = 0.0
+    for c in counts:
+        if c:
+            p = c / total
+            H -= p * math.log2(p)
+    return H
+
+def _counts_for_guess(args):
+    """
+    Worker for multiprocessing: given (guess, remaining_list) -> (guess, entropy_bits).
+    We bucket patterns only over the *remaining* solutions (not full all_words × all_words).
+    """
+    guess, remaining_list = args
+    buckets = [0]*243  # 3^5 possible patterns
+    for w in remaining_list:
+        pid = calculate_pattern_id(guess, w)
+        buckets[pid] += 1
+    return guess, _entropy_bits_from_counts(buckets)
+
+def calculate_entropies_parallel(guesses, remaining, n_jobs=None, show_progress=True):
+    remaining_list = list(remaining)
+    if not remaining_list:
+        return {g: 0.0 for g in guesses}
+    if n_jobs is None:
+        n_jobs = max(1, (cpu_count() or 1) - 1)
+
+    ent = {}
+    with Pool(processes=n_jobs) as pool:
+        it = pool.imap_unordered(_counts_for_guess, ((g, remaining_list) for g in guesses), chunksize=64)
+        if show_progress:
+            for g, H in tqdm(it, total=len(guesses), desc="Scoring (entropy)", disable=True):
+                ent[g] = H
+        else:
+            for g, H in it:
+                ent[g] = H
+    return ent
+
+def reduce_remaining(guess: str, target_feedback_id: int, remaining: set) -> set:
+    """Keep only words in `remaining` that would yield `target_feedback_id` for this guess."""
+    out = []
+    for w in remaining:
+        if calculate_pattern_id(guess, w) == target_feedback_id:
+            out.append(w)
+    return set(out)
+
 def calculate_pattern(guess: str, true: str) -> Tuple[int, int, int, int, int]:
     wrong = [i for i, v in enumerate(guess) if v != true[i]]
     counts = Counter(true[i] for i in wrong)
@@ -197,50 +280,76 @@ def convert_pattern_to_emoji_string(pattern: Tuple[int, ...]) -> str:
     }[i] for i in pattern)
 
 def analyze_play(guesses: List[str], target: str):
+    """
+    Memory-light, multicore critique.
+    - No global pattern cache is built.
+    - Entropy is computed against the current remaining solution set.
+    - Keeps your outputs/fields identical to your embed formatting.
+    """
     all_dictionary, solution_set, WORD_LEN = load_wordlists()
-    if target is None or target.strip().lower() == "None":
+    if target is None or str(target).strip().lower() == "none":
         target = guesses[-1]
     assert len(target) == WORD_LEN, f"Target must be {WORD_LEN} letters."
 
-    pattern_dict = load_or_build_pattern_cache(all_dictionary)
-    all_patterns = list(itertools.product([0, 1, 2], repeat=WORD_LEN))
     remaining_solutions = set(solution_set)
     remaining_allowed = set(all_dictionary)
     results = []
 
-    for round_idx, guess in enumerate(guesses, start=1):
-        LOGGER.debug(f"Round {round_idx}: Guessing '{guess}'")
-        guess = guess.strip().lower()
-        if guess not in pattern_dict:
+    allowed = set(all_dictionary)
+
+    for round_idx, raw_guess in enumerate(guesses, start=1):
+        LOGGER.debug(f"Round {round_idx}: Guessing '{raw_guess}'")
+        guess = raw_guess.strip().lower()
+        if guess not in allowed:
             raise ValueError(f"Guess '{guess}' not in allowed list.")
 
-        ent_bits, pattern_counts = calculate_entropies_bits(
-            all_dictionary, remaining_solutions, pattern_dict, all_patterns
+        # Score either all allowed (as you did) or just remaining for speed.
+        # Keeping behavior closest to your current approach: score all allowed.
+        ent_bits_map = calculate_entropies_parallel(
+            all_dictionary, remaining_solutions, n_jobs=None, show_progress=False
         )
-        best_guess, best_entropy_bits = max(ent_bits.items(), key=lambda kv: kv[1])
-        guess_entropy_bits = ent_bits[guess]
-        pct_expected = percentile_rank(list(ent_bits.values()), guess_entropy_bits)
 
-        pattern = calculate_pattern(guess, target)
-        observed_bucket_size = pattern_counts[guess][pattern]
+        # Best available move and your guess stats
+        best_guess, best_entropy_bits = max(ent_bits_map.items(), key=lambda kv: kv[1])
+        guess_entropy_bits = ent_bits_map.get(guess, 0.0)
+        pct_expected = percentile_rank(list(ent_bits_map.values()), guess_entropy_bits)
+
+        # Actual feedback vs target (tuple for emoji) and as compact id for filtering
+        pattern_tuple = calculate_pattern(guess, target)
+        feedback_id = calculate_pattern_id(guess, target)
+
         total_before = len(remaining_solutions)
+
+        # Compute "received info" by measuring the size of the observed pattern bucket
+        # among remaining_solutions (no cache; a single pass).
+        observed_bucket_size = 0
+        for w in remaining_solutions:
+            if calculate_pattern_id(guess, w) == feedback_id:
+                observed_bucket_size += 1
+
         received_info_bits = (
             float("inf") if observed_bucket_size < 1
             else math.log2(total_before / observed_bucket_size)
         )
         luck_bits = received_info_bits - guess_entropy_bits
 
-        # shrink remaining to solutions in the observed bucket
-        bucket_all = pattern_dict[guess].get(pattern, set())
-        bucket_solutions = bucket_all & solution_set
+        # Shrink remaining sets
+        new_remaining_solutions = reduce_remaining(guess, feedback_id, remaining_solutions)
+        remaining_allowed = reduce_remaining(guess, feedback_id, remaining_allowed)
+        remaining_solutions = new_remaining_solutions
 
-        remaining_solutions &= bucket_solutions
-        remaining_allowed &= bucket_all
-        # How "lucky" among all patterns for this guess?
+        # Info percentile across *this guess's* possible outcomes
         info_distribution = []
-        for _, size in pattern_counts[guess].items():
+        # Build info distribution in one pass without precomputed buckets
+        # (re-count by pattern for remaining_solutions)
+        pattern_sizes = [0]*243
+        for w in remaining_solutions if total_before else []:
+            pid = calculate_pattern_id(guess, w)
+            pattern_sizes[pid] += 1
+        for size in pattern_sizes:
             if size > 0:
                 info_distribution.append(math.log2(total_before / size))
+
         received_info_percentile = percentile_rank(info_distribution, received_info_bits) if info_distribution else 0.0
         if guess_entropy_bits == 0:
             received_info_percentile = 0.0
@@ -250,7 +359,7 @@ def analyze_play(guesses: List[str], target: str):
         results.append({
             "round": round_idx,
             "guess": guess,
-            "pattern": convert_pattern_to_emoji_string(pattern),
+            "pattern": convert_pattern_to_emoji_string(pattern_tuple),
             "percentile_expected": pct_expected,
             "guess_entropy_bits": guess_entropy_bits,
             "received_info_bits": received_info_bits,
@@ -262,7 +371,6 @@ def analyze_play(guesses: List[str], target: str):
             "remaining_allowed": len(remaining_allowed),
             "win": guess == target
         })
-        
 
     return results
 
